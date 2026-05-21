@@ -1,0 +1,4 @@
+torch>=2.0
+torchvision>=0.15
+faiss-cpu>=1.7  # or faiss-gpu for CUDA
+numpy
