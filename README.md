@@ -193,7 +193,7 @@ python3 train.py --dataset cifar10 --epochs 200 --batch-size 256
 | ★★★ | `--dataset` | `cifar10` | 使うデータセット。`cifar10` または `imagenet` |
 | ★★★ | `--data-path` | `./data` | データの場所。CIFAR-10は自動DL。ImageNetは手動で用意 |
 | ★★★ | `--arch` | `resnet18` | エンコーダ。論文はresnet50。動作確認はresnet18で十分 |
-| ★★★ | `--num-clusters` | `25000 50000 100000` | クラスタ数。PCLの核心部分。データセットサイズに合わせて調整が必要（CIFAR-10なら `50 200 500` 程度） |
+| ★★★ | `--num-clusters` | `50 200 500` | クラスタ数。PCLの核心部分。データセットサイズより小さい値にする必要がある。ImageNetなら `25000 50000 100000` |
 | ★★★ | `--epochs` | `200` | 総エポック数 |
 | ★★★ | `--output-dir` | `./checkpoints` | チェックポイントとt-SNE画像の保存先 |
 | ★★☆ | `--batch-size` | `256` | メモリが足りなければ減らす |
@@ -252,7 +252,7 @@ python3 train.py \
   --dataset imagenet \
   --data-path /path/to/imagenet \
   --arch resnet50 \
-  --num-clusters 25000 50000 100000 \
+  --num-clusters 25000 50000 100000 \  # ImageNetのときはここを変える
   --queue-size 65536 \
   --r 16000 \
   --epochs 200 \

@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--tau", default=0.1, type=float, help="temperature")
     p.add_argument("--r", default=16000, type=int, help="negative prototypes sampled per step")
     # Clustering (E-step)
-    p.add_argument("--num-clusters", nargs="+", type=int, default=[25000, 50000, 100000],
+    p.add_argument("--num-clusters", nargs="+", type=int, default=[50, 200, 500],
                    help="cluster granularities K = {k_1, ..., k_M}")
     p.add_argument("--alpha", default=10.0, type=float, help="concentration smoothing parameter")
     # Training
