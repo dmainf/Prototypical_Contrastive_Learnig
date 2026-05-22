@@ -36,27 +36,25 @@ class ProtoNCELoss(nn.Module):
         phi: torch.Tensor,
     ) -> torch.Tensor:
         """Prototypical contrastive loss for one granularity level (second term of Eq. 11)."""
+        K = prototypes.shape[0]
+        r = min(self.r, K - 1)
+
+        if r >= K - 1:
+            # K is small enough to use all prototypes — exact NCE with no double-counting
+            all_sim = torch.mm(q, prototypes.t()) / phi.unsqueeze(0)  # (N, K)
+            return F.cross_entropy(all_sim, assignments)
+
+        # Sample r negatives without replacement (positive excluded via randperm)
         N = q.shape[0]
         device = q.device
-        K = prototypes.shape[0]
+        pos_proto = prototypes[assignments]                              # (N, D)
+        pos_sim = (q * pos_proto).sum(dim=1) / phi[assignments]        # (N,)
 
-        prototypes = prototypes.to(device)
-        phi = phi.to(device)
+        neg_idx = torch.randperm(K, device=device)[:r]
+        neg_proto = prototypes[neg_idx]                                  # (r, D)
+        neg_sim = torch.mm(q, neg_proto.t()) / phi[neg_idx].unsqueeze(0) # (N, r)
 
-        # Positive: each sample's assigned prototype
-        pos_proto = prototypes[assignments]                          # (N, D)
-        pos_phi = phi[assignments]                                   # (N,)
-        pos_sim = (q * pos_proto).sum(dim=1) / pos_phi              # (N,)
-
-        # Sample r random negative prototypes
-        r = min(self.r, K)
-        neg_idx = torch.randint(0, K, (r,), device=device)
-        neg_proto = prototypes[neg_idx]                              # (r, D)
-        neg_phi = phi[neg_idx]                                       # (r,)
-        neg_sim = torch.mm(q, neg_proto.t()) / neg_phi.unsqueeze(0) # (N, r)
-
-        # Cross-entropy: positive is at column 0
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # (N, 1+r)
+        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)      # (N, 1+r)
         labels = torch.zeros(N, dtype=torch.long, device=device)
         return F.cross_entropy(logits, labels)
 
@@ -80,9 +78,9 @@ class ProtoNCELoss(nn.Module):
         loss = self._info_nce(q, k, queue)
 
         if not warm_up and cluster_results:
-            proto_loss = torch.tensor(0.0, device=q.device)
+            proto_loss = 0.0
             for centroids, assignments_all, phi in cluster_results:
-                batch_assign = assignments_all[sample_indices.cpu()].to(q.device)
+                batch_assign = assignments_all[sample_indices]
                 proto_loss = proto_loss + self._proto_nce_single(q, centroids, batch_assign, phi)
             loss = loss + proto_loss / len(cluster_results)
 

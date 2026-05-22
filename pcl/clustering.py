@@ -20,8 +20,8 @@ def _kmeans_faiss(features: np.ndarray, k: int, niter: int = 20) -> tuple:
 
 
 def _kmeans_sklearn(features: np.ndarray, k: int) -> tuple:
-    from sklearn.cluster import MiniBatchKMeans
-    km = MiniBatchKMeans(n_clusters=k, n_init=3, max_iter=100, random_state=42)
+    from sklearn.cluster import KMeans
+    km = KMeans(n_clusters=k, n_init=3, max_iter=100, random_state=42)
     assignments = km.fit_predict(features)
     return km.cluster_centers_.astype(np.float32), assignments
 
@@ -47,15 +47,14 @@ def _concentration(
 ) -> np.ndarray:
     """Per-prototype concentration φ (Eq. 12 in the paper)."""
     k = centroids.shape[0]
-    phi = np.ones(k, dtype=np.float32)
-    for c in range(k):
-        mask = assignments == c
-        Z = int(mask.sum())
-        if Z == 0:
-            continue
-        dists = np.linalg.norm(features[mask] - centroids[c], axis=1)
-        phi[c] = float(dists.sum()) / (Z * np.log(Z + alpha))
-    return phi
+    dists = np.linalg.norm(features - centroids[assignments], axis=1)  # (N,)
+    dist_sum = np.zeros(k, dtype=np.float64)
+    np.add.at(dist_sum, assignments, dists)
+    sizes = np.bincount(assignments, minlength=k).astype(np.float64)
+    phi = np.ones(k, dtype=np.float64)
+    nonzero = sizes > 0
+    phi[nonzero] = dist_sum[nonzero] / (sizes[nonzero] * np.log(sizes[nonzero] + alpha))
+    return phi.astype(np.float32)
 
 
 def cluster_features(
@@ -82,6 +81,9 @@ def cluster_features(
         mean_phi = phi.mean()
         if mean_phi > 0:
             phi = phi / mean_phi * tau
+        # L2-normalize centroids (paper sec 3.2: l2-normalization applied to both v and c)
+        norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+        centroids = centroids / np.maximum(norms, 1e-8)
         results.append((
             torch.tensor(centroids, dtype=torch.float32),
             torch.tensor(assignments, dtype=torch.long),

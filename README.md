@@ -57,8 +57,10 @@ L_ProtoNCE = L_InfoNCE (インスタンスワイズ) + (1/M) * Σ L_proto_m (プ
 | メソッド | 役割 |
 |---|---|
 | `_info_nce` | MoCo方式のInfoNCE損失。qとkの正例ペア vs キュー内の負例 |
-| `_proto_nce_single` | 1粒度分のプロトタイプ対照損失。qと割当プロトタイプ(正例) vs ランダムサンプルしたrプロトタイプ(負例) |
+| `_proto_nce_single` | 1粒度分のプロトタイプ対照損失。r ≥ K−1 のとき全プロトタイプで正確なNCE、r < K−1 のとき randperm でr個サンプリング（重複なし） |
 | `forward` | warm_up=True のときはInfoNCEのみ、Falseのときは両方の和を返す |
+
+**負例サンプリングの扱い**: K が小さい（CIFAR-10: K=50 で r=49）場合は全プロトタイプを分母に使う完全なクロスエントロピーに切り替わる。これにより positive prototype の二重カウントを防ぐ。
 
 ---
 
@@ -68,8 +70,8 @@ EMフレームワークのE-stepに対応。
 
 | 関数 | 役割 |
 |---|---|
-| `_run_kmeans` | faiss (Linux) または sklearn (macOS) でk-meansを実行 |
-| `_concentration` | 各プロトタイプの濃度 φ を計算 (論文 Eq.12) |
+| `_run_kmeans` | faiss (Linux) または sklearn KMeans (macOS) でk-meansを実行 |
+| `_concentration` | 各プロトタイプの濃度 φ を計算 (論文 Eq.12)。numpy ベクトル化で高速 |
 | `cluster_features` | k_listの各kに対してクラスタリング＋φ計算をまとめて実行 |
 
 **濃度推定 φ (Eq.12)**:
@@ -81,8 +83,12 @@ EMフレームワークのE-stepに対応。
 - クラスタが疎 → φ大 → 類似度をダウンスケール（崩壊防止）
 - クラスタが密 → φ小 → 類似度をアップスケール
 - 最後に `mean(φ) = τ` になるよう正規化
+- **φ計算後、セントロイドをL2正規化して返す** (論文 Sec.3.2: "apply l₂-normalization to both v and c")
 
 戻り値は `(centroids, assignments, phi)` のリスト（粒度M個分）。
+- `centroids`: L2正規化済み (k, D)
+- `assignments`: 全訓練サンプルのクラスタ割当 (N,)
+- `phi`: 正規化済み濃度 (k,)
 
 ---
 
@@ -308,6 +314,7 @@ python3 visualize_tsne.py \
 | ProtoNCE損失 Eq.11 | `pcl/loss.py:ProtoNCELoss` |
 | 濃度推定 φ Eq.12 | `pcl/clustering.py:_concentration` |
 | φの正規化 (mean=τ) | `pcl/clustering.py:cluster_features` |
+| セントロイドL2正規化 (Sec.3.2) | `pcl/clustering.py:cluster_features` (φ計算後に実施) |
 | Momentumエンコーダ EMA更新 | `pcl/model.py:_update_momentum_encoder` |
 | 負例キュー | `pcl/model.py:queue`, `_enqueue` |
 | 階層的プロトタイプ (M粒度) | `cluster_features` の `k_list` |

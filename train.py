@@ -88,12 +88,11 @@ def build_loaders(args, pin_memory: bool = False):
     if args.dataset == "cifar10":
         train_tf = TwoViewTransform(cifar10_train_transform())
         cluster_tf = cifar10_eval_transform()
-        raw = datasets.CIFAR10(args.data_path, train=True, download=True)
         train_ds = datasets.CIFAR10(args.data_path, train=True,
                                     transform=train_tf, download=True)
         cluster_ds = datasets.CIFAR10(args.data_path, train=True,
                                       transform=cluster_tf, download=True)
-        n = len(raw)
+        n = len(train_ds)
         args.num_clusters = [k for k in args.num_clusters if k < n]
         if not args.num_clusters:
             args.num_clusters = [10, 50, 200]
@@ -237,10 +236,14 @@ def main():
         if not warm_up:
             print(f"[Epoch {epoch}] E-step: extracting features for clustering...")
             features = model.get_features(cluster_loader, device)
-            features_np = features.numpy().astype("float32")
             cluster_results = cluster_features(
-                features_np, args.num_clusters, args.alpha, args.tau
+                features.numpy(), args.num_clusters, args.alpha, args.tau
             )
+            # Transfer centroids and phi to device once per epoch; keep assignments on device
+            cluster_results = [
+                (c.to(device), a.to(device), p.to(device))
+                for c, a, p in cluster_results
+            ]
 
         # ── M-step: one epoch of gradient updates ────────────────────────────
         model.train()
@@ -256,11 +259,11 @@ def main():
                 q, k,
                 model.queue,
                 cluster_results,
-                indices,
+                indices.to(device),
                 warm_up=warm_up,
             )
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 

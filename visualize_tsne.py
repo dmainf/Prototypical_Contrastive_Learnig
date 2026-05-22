@@ -58,18 +58,26 @@ def parse_args():
 
 
 def load_encoder(checkpoint_path: str, arch: str, device: torch.device) -> nn.Module:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    saved_args = ckpt.get("args", {})
+    dim = saved_args.get("dim", 128)
+    use_mlp = saved_args.get("use_mlp", False)
+
     encoder = getattr(models, arch)(weights=None)
     feat_dim = encoder.fc.in_features
-    encoder.fc = nn.Identity()
+    if use_mlp:
+        encoder.fc = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim), nn.ReLU(), nn.Linear(feat_dim, dim)
+        )
+    else:
+        encoder.fc = nn.Linear(feat_dim, dim)
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    # encoder_k (Momentumエンコーダ) の重みを使う
     state = {
         k.replace("encoder_k.", ""): v
         for k, v in ckpt["state_dict"].items()
         if k.startswith("encoder_k.")
     }
-    encoder.load_state_dict(state, strict=False)
+    encoder.load_state_dict(state, strict=True)
     encoder.to(device).eval()
     for p in encoder.parameters():
         p.requires_grad = False
