@@ -17,8 +17,13 @@ import argparse
 import os
 import time
 
+import resource
 import numpy as np
 import torch
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, _hard), _hard))
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib
