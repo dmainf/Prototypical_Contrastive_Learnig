@@ -14,6 +14,7 @@ Usage (ImageNet):
 """
 
 import argparse
+import gc
 import os
 import time
 
@@ -178,6 +179,14 @@ def save_tsne(model, args, epoch: int, device: torch.device):
     print(f"  → t-SNE saved: {out_path}")
 
 
+def _empty_cache(device: torch.device):
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def save_checkpoint(state, path):
     torch.save(state, path)
     print(f"  → saved {path}")
@@ -234,11 +243,16 @@ def main():
 
         # ── E-step: clustering ───────────────────────────────────────────────
         if not warm_up:
+            cluster_results = None
+            _empty_cache(device)
             print(f"[Epoch {epoch}] E-step: extracting features for clustering...")
             features = model.get_features(cluster_loader, device)
             cluster_results = cluster_features(
                 features.numpy(), args.num_clusters, args.alpha, args.tau
             )
+            del features
+            gc.collect()
+            _empty_cache(device)
             # Transfer centroids and phi to device once per epoch; keep assignments on device
             cluster_results = [
                 (c.to(device), a.to(device), p.to(device))
@@ -276,13 +290,14 @@ def main():
 
         scheduler.step()
         elapsed = time.time() - t0
-        print(f"[Epoch {epoch}] avg_loss={total_loss/len(train_loader):.4f}  "
-              f"time={elapsed:.1f}s")
+        avg_loss = total_loss / len(train_loader)
+        print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}  time={elapsed:.1f}s")
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
             save_checkpoint(
                 {
                     "epoch": epoch,
+                    "avg_loss": avg_loss,
                     "state_dict": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),

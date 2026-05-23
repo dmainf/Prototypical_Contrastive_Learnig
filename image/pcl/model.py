@@ -91,8 +91,10 @@ class PCL(nn.Module):
             images = batch[0]
             if isinstance(images, (list, tuple)):
                 images = images[0]
-            images = images.to(device)
-            feats = nn.functional.normalize(self.encoder_k(images), dim=1)
+            feats = nn.functional.normalize(self.encoder_k(images.to(device)), dim=1)
             all_features.append(feats.cpu())
+            del feats
         self.encoder_k.train()
-        return torch.cat(all_features, dim=0)
+        out = torch.cat(all_features, dim=0)
+        del all_features
+        return out

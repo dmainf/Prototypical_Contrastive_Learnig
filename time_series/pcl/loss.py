@@ -40,19 +40,16 @@ class ProtoNCELoss(nn.Module):
         device = q.device
         K = prototypes.shape[0]
 
-        prototypes = prototypes.to(device)
-        phi = phi.to(device)
-
         # Positive: each sample's assigned prototype
         pos_proto = prototypes[assignments]                          # (N, D)
-        pos_phi = phi[assignments]                                   # (N,)
+        pos_phi = phi[assignments].clamp(min=1e-4)                   # (N,)
         pos_sim = (q * pos_proto).sum(dim=1) / pos_phi              # (N,)
 
         # Sample r random negative prototypes
         r = min(self.r, K)
-        neg_idx = torch.randint(0, K, (r,), device=device)
+        neg_idx = torch.randperm(K, device=device)[:r]
         neg_proto = prototypes[neg_idx]                              # (r, D)
-        neg_phi = phi[neg_idx]                                       # (r,)
+        neg_phi = phi[neg_idx].clamp(min=1e-4)                      # (r,)
         neg_sim = torch.mm(q, neg_proto.t()) / neg_phi.unsqueeze(0) # (N, r)
 
         # Cross-entropy: positive is at column 0

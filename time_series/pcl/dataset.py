@@ -108,42 +108,60 @@ class TimeSeriesDataset(Dataset):
         transform=None,
     ):
         self.seq_len = seq_len
+        self.stride = stride
         self.transform = transform
+        self.variables = variables
 
         df = pd.read_csv(path)
         if "date" in df.columns:
             df = df.drop(columns=["date"])
 
         if variables == "univariate":
-            data = df[[target_col]].values.astype(np.float32)
+            raw = df[[target_col]].values.astype(np.float32)   # (T, 1)
         else:
-            data = df.select_dtypes(include=[np.number]).values.astype(np.float32)
+            raw = df.select_dtypes(include=[np.number]).values.astype(np.float32)  # (T, C)
 
         # 分割
-        n = len(data)
+        n = len(raw)
         s, e = self.SPLIT_RATIOS[split]
-        data = data[int(n * s):int(n * e)]
+        raw = raw[int(n * s):int(n * e)]
 
-        # Z-score正規化（std=0のカラムはそのまま）
-        mean = data.mean(axis=0)
-        std = data.std(axis=0)
-        data = (data - mean) / (std + 1e-8)
+        # Z-score正規化（カラムごと）
+        mean = raw.mean(axis=0)
+        std = raw.std(axis=0)
+        raw = (raw - mean) / (std + 1e-8)
 
-        self.data = data          # (T, C)
-        self.stride = stride
-        self.indices = list(range(0, len(data) - seq_len + 1, stride))
+        if variables == "individuals":
+            # 各列を独立した個体の単変量系列として扱う
+            # self.data: (N_individuals, T)
+            self.data = torch.tensor(raw.T, dtype=torch.float32)
+            self.n_individuals = self.data.shape[0]
+            self.n_windows_per_individual = (raw.shape[0] - seq_len) // stride + 1
+            self.n_windows = self.n_individuals * self.n_windows_per_individual
+        else:
+            # (C, T) — 全チャンネルを1サンプルとして扱う通常モード
+            self.data = torch.tensor(raw.T, dtype=torch.float32)
+            self.n_windows = (raw.shape[0] - seq_len) // stride + 1
 
     @property
     def in_channels(self):
-        return self.data.shape[1]
+        return 1 if self.variables == "individuals" else self.data.shape[0]
 
     def __len__(self):
-        return len(self.indices)
+        return self.n_windows
 
     def __getitem__(self, idx):
-        start = self.indices[idx]
-        window = self.data[start:start + self.seq_len]      # (seq_len, C)
-        x = torch.tensor(window.T, dtype=torch.float32)    # (C, seq_len)
+        if self.variables == "individuals":
+            individual = idx // self.n_windows_per_individual
+            window_idx = idx % self.n_windows_per_individual
+            start = window_idx * self.stride
+            x = self.data[individual, start:start + self.seq_len].unsqueeze(0)  # (1, seq_len)
+            label = individual
+        else:
+            start = idx * self.stride
+            x = self.data[:, start:start + self.seq_len]   # (C, seq_len)
+            label = 0
+
         if self.transform:
-            x = self.transform(x)
-        return x, 0
+            x = self.transform(x.clone())
+        return x, label

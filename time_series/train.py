@@ -39,22 +39,25 @@ def parse_args():
     p = argparse.ArgumentParser()
 
     # データ
-    p.add_argument("--data-path", default="./datasets/ETT-small/ETTh1.csv",
+    p.add_argument("--data-path", default="./datasets/electricity/electricity.csv",
                    help="CSVファイルのパス")
-    p.add_argument("--variables", default="univariate",
-                   choices=["univariate", "multivariate"],
-                   help="univariate: target-colのみ / multivariate: 全数値カラム")
+    p.add_argument("--variables", default="individuals",
+                   choices=["univariate", "multivariate", "individuals"],
+                   help="univariate: target-colのみ / multivariate: 全チャンネルを1サンプル / individuals: 列ごとに独立した個体")
     p.add_argument("--target-col", default="OT",
                    help="univariateのときに使うカラム名")
-    p.add_argument("--seq-len", default=96, type=int,
+    p.add_argument("--seq-len", default=512, type=int,
                    help="1サンプルのウィンドウ長")
-    p.add_argument("--stride", default=1, type=int,
-                   help="スライディングウィンドウのストライド")
+    p.add_argument("--stride", default=None, type=int,
+                   help="スライディングウィンドウのストライド（デフォルト: seq-lenと同じ）")
 
     # エンコーダ
-    p.add_argument("--encoder", default="transformer",
-                   choices=["transformer", "cnn"],
+    p.add_argument("--encoder", default="chronos",
+                   choices=["transformer", "cnn", "chronos"],
                    help="エンコーダアーキテクチャ")
+    p.add_argument("--chronos-model", default="amazon/chronos-bolt-small",
+                   help="Chronos-Bolt のモデル名（--encoder chronos のみ有効）"
+                        " 例: amazon/chronos-bolt-mini, amazon/chronos-bolt-small, amazon/chronos-bolt-base")
     p.add_argument("--d-model", default=64, type=int,
                    help="Transformerの埋め込み次元（--encoder transformer のみ有効）")
     p.add_argument("--nhead", default=4, type=int,
@@ -85,11 +88,13 @@ def parse_args():
     p.add_argument("--num-clusters", nargs="+", type=int, default=[50, 200, 500],
                    help="クラスタ数（複数指定で階層的プロトタイプ）")
     p.add_argument("--alpha", default=10.0, type=float)
+    p.add_argument("--cluster-samples", default=50000, type=int,
+                   help="E-stepで使うサンプル数（0=全件）")
 
     # 学習
-    p.add_argument("--epochs", default=200, type=int)
-    p.add_argument("--warm-up-epochs", default=20, type=int)
-    p.add_argument("--batch-size", default=256, type=int)
+    p.add_argument("--epochs", default=100, type=int)
+    p.add_argument("--warm-up-epochs", default=10, type=int)
+    p.add_argument("--batch-size", default=128, type=int)
     p.add_argument("--lr", default=1e-4, type=float,
                    help="学習率（Transformerはresnetより小さい値が安定）")
     p.add_argument("--weight-decay", default=1e-4, type=float)
@@ -106,7 +111,10 @@ def parse_args():
     p.add_argument("--tsne-samples", default=500, type=int,
                    help="t-SNEで使うサンプル数")
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.stride is None:
+        args.stride = args.seq_len
+    return args
 
 
 def build_loaders(args, pin_memory: bool = False):
@@ -187,6 +195,7 @@ def save_tsne(model, args, epoch: int, device: torch.device):
 
 
 def save_checkpoint(state, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
     print(f"  → saved {path}")
 
@@ -221,6 +230,7 @@ def main():
         dim=args.dim,
         queue_size=args.queue_size,
         momentum=args.momentum,
+        chronos_model_name=args.chronos_model,
     ).to(device)
 
     optimizer = optim.Adam(model.encoder_q.parameters(),
@@ -230,6 +240,7 @@ def main():
 
     start_epoch = 0
     cluster_results = None
+    loss_history = []
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -239,6 +250,14 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         print(f"Resumed from epoch {start_epoch}")
 
+    if start_epoch == 0:
+        save_checkpoint(
+            {"epoch": -1, "state_dict": model.state_dict(),
+             "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+             "args": vars(args)},
+            os.path.join(args.output_dir, "pcl_epoch0000.pth"),
+        )
+
     for epoch in range(start_epoch, args.epochs):
         warm_up = epoch < args.warm_up_epochs
         t0 = time.time()
@@ -246,11 +265,28 @@ def main():
         # E-step
         if not warm_up:
             print(f"[Epoch {epoch}] E-step: extracting features...")
-            features = model.get_features(cluster_loader, device)
-            cluster_results = cluster_features(
-                features.numpy().astype("float32"),
-                args.num_clusters, args.alpha, args.tau,
-            )
+            if args.cluster_samples > 0 and args.cluster_samples < len(cluster_loader.dataset):
+                idx = torch.randperm(len(cluster_loader.dataset))[:args.cluster_samples].tolist()
+                sub_loader = DataLoader(
+                    Subset(cluster_loader.dataset, idx),
+                    batch_size=cluster_loader.batch_size, shuffle=False,
+                    num_workers=args.workers,
+                )
+                features = model.get_features(sub_loader, device)
+            else:
+                features = model.get_features(cluster_loader, device)
+            features_np = features.numpy().astype("float32")
+            nan_mask = np.isfinite(features_np).all(axis=1)
+            if not nan_mask.all():
+                print(f"  [warning] {(~nan_mask).sum()} NaN features dropped before clustering")
+                features_np = features_np[nan_mask]
+            cluster_results = [
+                (c.to(device), a, p.to(device))
+                for c, a, p in cluster_features(
+                    features_np,
+                    args.num_clusters, args.alpha, args.tau,
+                )
+            ]
 
         # M-step
         model.train()
@@ -265,6 +301,7 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.encoder_q.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -275,7 +312,9 @@ def main():
 
         scheduler.step()
         elapsed = time.time() - t0
-        print(f"[Epoch {epoch}] avg_loss={total_loss/len(train_loader):.4f}  time={elapsed:.1f}s")
+        avg_loss = total_loss / len(train_loader)
+        loss_history.append(avg_loss)
+        print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}  time={elapsed:.1f}s")
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
             save_checkpoint(
@@ -289,6 +328,18 @@ def main():
             print(f"[Epoch {epoch}] Generating t-SNE...")
             save_tsne(model, args, epoch, device)
 
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(range(start_epoch, start_epoch + len(loss_history)), loss_history)
+    ax.axvline(x=args.warm_up_epochs - 1, color="gray", linestyle="--", label="warm-up end")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Avg Loss")
+    ax.set_title("Training Loss Curve")
+    ax.legend()
+    plt.tight_layout()
+    loss_path = os.path.join(args.output_dir, "loss_curve.png")
+    fig.savefig(loss_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Loss curve saved: {loss_path}")
 
 if __name__ == "__main__":
     main()

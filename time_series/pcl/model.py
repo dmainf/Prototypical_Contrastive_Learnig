@@ -13,6 +13,7 @@ class _TransformerEncoder(nn.Module):
     def __init__(self, in_channels=1, seq_len=96, d_model=64,
                  nhead=4, num_layers=2, dim=128, dropout=0.1):
         super().__init__()
+        self.out_dim = dim
         self.input_proj = nn.Linear(in_channels, d_model)
         self.pos_enc = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.01)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -40,6 +41,7 @@ class _CNN1DEncoder(nn.Module):
     """
     def __init__(self, in_channels=1, dim=128):
         super().__init__()
+        self.out_dim = dim
         self.net = nn.Sequential(
             nn.Conv1d(in_channels, 32, kernel_size=8, stride=2, padding=3),
             nn.ReLU(),
@@ -56,6 +58,51 @@ class _CNN1DEncoder(nn.Module):
         return self.fc(x)
 
 
+class ChronosBoltEncoder(nn.Module):
+    """
+    Chronos-Bolt をバックボーンとするエンコーダ。
+    backbone は完全凍結。proj のみ学習される。
+    入力: (batch, in_channels, seq_len)
+    出力: (batch, dim)
+    """
+    def __init__(self, chronos_model, dim: int = 128):
+        super().__init__()
+        d = chronos_model.config.d_model
+        self.out_dim = dim
+        self.chronos = chronos_model
+        self.proj = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(),
+            nn.Linear(d, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, C, L = x.shape
+        if C == 1:
+            context = x.squeeze(1).float()
+            with torch.no_grad():
+                hidden, _, _, _ = self.chronos.encode(context)
+            feat = hidden[:, -1, :]
+        else:
+            feats = []
+            for c in range(C):
+                ctx = x[:, c, :].float()
+                with torch.no_grad():
+                    hidden, _, _, _ = self.chronos.encode(ctx)
+                feats.append(hidden[:, -1, :])
+            feat = torch.stack(feats, dim=1).mean(dim=1)
+        return self.proj(feat)
+
+
+def _load_chronos_backbone(model_name: str):
+    from chronos import ChronosBoltPipeline
+    pipe = ChronosBoltPipeline.from_pretrained(model_name, device_map="cpu", dtype=torch.float32)
+    backbone = pipe.model
+    for p in backbone.parameters():
+        p.requires_grad = False
+    return backbone
+
+
 def build_encoder(encoder_type: str, in_channels: int, seq_len: int,
                   d_model: int, nhead: int, num_layers: int, dim: int):
     if encoder_type == "transformer":
@@ -63,7 +110,7 @@ def build_encoder(encoder_type: str, in_channels: int, seq_len: int,
     elif encoder_type == "cnn":
         return _CNN1DEncoder(in_channels, dim)
     else:
-        raise ValueError(f"Unknown encoder_type: {encoder_type}. Choose 'transformer' or 'cnn'.")
+        raise ValueError(f"Unknown encoder_type: {encoder_type}. Choose 'transformer', 'cnn', or 'chronos'.")
 
 
 # ── PCL モデル ────────────────────────────────────────────────────────────────
@@ -85,13 +132,20 @@ class PCL(nn.Module):
         dim: int = 128,
         queue_size: int = 4096,
         momentum: float = 0.999,
+        chronos_model_name: str = "amazon/chronos-bolt-small",
     ):
         super().__init__()
         self.momentum = momentum
         self.queue_size = queue_size
 
-        def _make():
-            return build_encoder(encoder_type, in_channels, seq_len, d_model, nhead, num_layers, dim)
+        if encoder_type == "chronos":
+            print(f"Loading Chronos-Bolt backbone: {chronos_model_name} ...")
+            backbone = _load_chronos_backbone(chronos_model_name)
+            def _make():
+                return ChronosBoltEncoder(backbone, dim)
+        else:
+            def _make():
+                return build_encoder(encoder_type, in_channels, seq_len, d_model, nhead, num_layers, dim)
 
         self.encoder_q = _make()
         self.encoder_k = _make()
@@ -100,7 +154,8 @@ class PCL(nn.Module):
             p_k.data.copy_(p_q.data)
             p_k.requires_grad = False
 
-        self.register_buffer("queue", torch.randn(dim, queue_size))
+        feat_dim = self.encoder_q.out_dim
+        self.register_buffer("queue", torch.randn(feat_dim, queue_size))
         self.queue = nn.functional.normalize(self.queue, dim=0)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
