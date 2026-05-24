@@ -1,14 +1,13 @@
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 
 class Jitter:
-    """ガウスノイズを付加する。"""
+    """ガウスノイズを付加する。波形の大局的な周期性・位相を保持する。"""
     def __init__(self, sigma: float = 0.03):
         self.sigma = sigma
 
@@ -16,30 +15,53 @@ class Jitter:
         return x + torch.randn_like(x) * self.sigma
 
 
-class WindowSlicing:
+class Scaling:
     """
-    ウィンドウをランダムにクロップして元の長さにリサイズする（画像のRandomCropに相当）。
-    ratio: クロップするウィンドウ長の割合（デフォルト0.9 = 90%を切り取る）
+    信号全体にランダムなスカラーを乗算する。
+    振幅の絶対値ではなく波形ダイナミクスの形状に着目させる。
     """
-    def __init__(self, ratio: float = 0.9):
-        self.ratio = ratio
+    def __init__(self, scale_range: tuple = (0.8, 1.2)):
+        self.low, self.high = scale_range
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        scale = torch.empty(1).uniform_(self.low, self.high).item()
+        return x * scale
+
+
+class ContinuousMasking:
+    """
+    系列の中間にある連続した区間をゼロでマスクする。
+    時間軸を伸縮させないため周波数特性を完全に保持する。
+    mask_ratio: マスクする区間長の割合（デフォルト0.2 = 20%をマスク）
+    """
+    def __init__(self, mask_ratio: float = 0.2):
+        self.mask_ratio = mask_ratio
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         L = x.shape[-1]
-        slice_len = max(2, int(L * self.ratio))
-        start = torch.randint(0, L - slice_len + 1, (1,)).item()
-        sliced = x[:, start:start + slice_len]
-        return F.interpolate(sliced.unsqueeze(0), size=L, mode="linear",
-                             align_corners=False).squeeze(0)
+        mask_len = max(1, int(L * self.mask_ratio))
+        start = torch.randint(0, L - mask_len + 1, (1,)).item()
+        out = x.clone()
+        out[:, start:start + mask_len] = 0.0
+        return out
 
 
 class TimeSeriesAugmentation:
-    """Jitter + WindowSlicing を組み合わせたAugmentation。"""
-    def __init__(self, jitter_sigma: float = 0.03, slice_ratio: float = 0.9,
-                 use_jitter: bool = True, use_slicing: bool = True):
+    """Scaling + ContinuousMasking + Jitter を組み合わせたAugmentation。"""
+    def __init__(
+        self,
+        jitter_sigma: float = 0.03,
+        scale_range: tuple = (0.8, 1.2),
+        mask_ratio: float = 0.2,
+        use_jitter: bool = True,
+        use_scaling: bool = True,
+        use_masking: bool = True,
+    ):
         self.augments = []
-        if use_slicing:
-            self.augments.append(WindowSlicing(slice_ratio))
+        if use_scaling:
+            self.augments.append(Scaling(scale_range))
+        if use_masking:
+            self.augments.append(ContinuousMasking(mask_ratio))
         if use_jitter:
             self.augments.append(Jitter(jitter_sigma))
 

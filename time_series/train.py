@@ -22,9 +22,7 @@ import torch.optim as optim
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from torch.utils.data import DataLoader, Subset
-from sklearn.manifold import TSNE
+from torch.utils.data import DataLoader
 
 from pcl.model import PCL
 from pcl.loss import ProtoNCELoss
@@ -70,26 +68,26 @@ def parse_args():
     # Augmentation
     p.add_argument("--jitter-sigma", default=0.03, type=float,
                    help="Jitterのノイズ強度")
-    p.add_argument("--slice-ratio", default=0.9, type=float,
-                   help="WindowSlicingの切り取り割合（0〜1）")
+    p.add_argument("--scale-range", nargs=2, type=float, default=[0.8, 1.2],
+                   metavar=("LOW", "HIGH"),
+                   help="Scalingの振幅スケール範囲")
+    p.add_argument("--mask-ratio", default=0.2, type=float,
+                   help="ContinuousMaskingでマスクする区間長の割合（0〜1）")
     p.add_argument("--no-jitter", action="store_true",
                    help="Jitterを無効化する")
-    p.add_argument("--no-slicing", action="store_true",
-                   help="WindowSlicingを無効化する")
+    p.add_argument("--no-scaling", action="store_true",
+                   help="Scalingを無効化する")
+    p.add_argument("--no-masking", action="store_true",
+                   help="ContinuousMaskingを無効化する")
 
     # 対照学習
     p.add_argument("--queue-size", default=4096, type=int)
     p.add_argument("--momentum", default=0.999, type=float)
     p.add_argument("--tau", default=0.1, type=float)
-    p.add_argument("--r", default=500, type=int,
-                   help="1ステップでサンプルする負例プロトタイプ数")
-
     # クラスタリング
     p.add_argument("--num-clusters", nargs="+", type=int, default=[50, 200, 500],
                    help="クラスタ数（複数指定で階層的プロトタイプ）")
     p.add_argument("--alpha", default=10.0, type=float)
-    p.add_argument("--cluster-samples", default=50000, type=int,
-                   help="E-stepで使うサンプル数（0=全件）")
 
     # 学習
     p.add_argument("--epochs", default=100, type=int)
@@ -105,12 +103,6 @@ def parse_args():
     p.add_argument("--save-freq", default=10, type=int)
     p.add_argument("--resume", default="", type=str)
 
-    # t-SNE
-    p.add_argument("--tsne-freq", default=0, type=int,
-                   help="Nエポックごとにt-SNE画像を保存（0=無効）")
-    p.add_argument("--tsne-samples", default=500, type=int,
-                   help="t-SNEで使うサンプル数")
-
     args = p.parse_args()
     if args.stride is None:
         args.stride = args.seq_len
@@ -120,9 +112,11 @@ def parse_args():
 def build_loaders(args, pin_memory: bool = False):
     aug = TimeSeriesAugmentation(
         jitter_sigma=args.jitter_sigma,
-        slice_ratio=args.slice_ratio,
+        scale_range=tuple(args.scale_range),
+        mask_ratio=args.mask_ratio,
         use_jitter=not args.no_jitter,
-        use_slicing=not args.no_slicing,
+        use_scaling=not args.no_scaling,
+        use_masking=not args.no_masking,
     )
 
     train_ds = TimeSeriesDataset(
@@ -142,7 +136,6 @@ def build_loaders(args, pin_memory: bool = False):
     args.num_clusters = [k for k in args.num_clusters if k < n]
     if not args.num_clusters:
         args.num_clusters = [10, 50, 100]
-    args.r = min(args.r, min(args.num_clusters) - 1)
     args.queue_size = min(args.queue_size, n)
 
     indexed_ds = IndexedDataset(train_ds)
@@ -151,47 +144,6 @@ def build_loaders(args, pin_memory: bool = False):
     cluster_loader = DataLoader(cluster_ds, batch_size=args.batch_size * 2, shuffle=False,
                                 num_workers=args.workers, pin_memory=pin_memory)
     return train_loader, cluster_loader, train_ds.in_channels
-
-
-def save_tsne(model, args, epoch: int, device: torch.device):
-    """学習中のMomentumエンコーダでt-SNEを生成して保存する。"""
-    ds = TimeSeriesDataset(
-        path=args.data_path, variables=args.variables,
-        target_col=args.target_col, seq_len=args.seq_len,
-        stride=args.stride, split="train", transform=None,
-    )
-    n = len(ds)
-    samples = min(args.tsne_samples, n)
-    idx = np.linspace(0, n - 1, samples, dtype=int)
-    subset = Subset(ds, idx.tolist())
-    loader = DataLoader(subset, batch_size=256, shuffle=False, num_workers=2)
-
-    model.encoder_k.eval()
-    feats = []
-    with torch.no_grad():
-        for x, _ in loader:
-            f = nn.functional.normalize(model.encoder_k(x.to(device)), dim=1)
-            feats.append(f.cpu().numpy())
-    model.encoder_k.train()
-    feats = np.concatenate(feats)
-
-    tsne = TSNE(n_components=2, perplexity=30, max_iter=1000, random_state=42, verbose=0)
-    emb = tsne.fit_transform(feats)
-
-    # 時刻位置で色付け（青=系列の始め → 赤=終わり）
-    time_pos = np.linspace(0, 1, samples)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sc = ax.scatter(emb[:, 0], emb[:, 1], c=time_pos, cmap="coolwarm", s=8, alpha=0.7)
-    plt.colorbar(sc, ax=ax, label="time position (0=start, 1=end)")
-    ax.set_title(f"t-SNE  epoch={epoch}  ({samples} windows, colored by time)", fontsize=12)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    plt.tight_layout()
-
-    out_path = os.path.join(args.output_dir, f"tsne_epoch{epoch+1:04d}.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  → t-SNE saved: {out_path}")
 
 
 def save_checkpoint(state, path):
@@ -233,10 +185,12 @@ def main():
         chronos_model_name=args.chronos_model,
     ).to(device)
 
-    optimizer = optim.Adam(model.encoder_q.parameters(),
-                           lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.Adam(
+        filter(lambda p: p.requires_grad, model.encoder_q.parameters()),
+        lr=args.lr, weight_decay=args.weight_decay,
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = ProtoNCELoss(tau=args.tau, r=args.r)
+    criterion = ProtoNCELoss(tau=args.tau)
 
     start_epoch = 0
     cluster_results = None
@@ -265,21 +219,12 @@ def main():
         # E-step
         if not warm_up:
             print(f"[Epoch {epoch}] E-step: extracting features...")
-            if args.cluster_samples > 0 and args.cluster_samples < len(cluster_loader.dataset):
-                idx = torch.randperm(len(cluster_loader.dataset))[:args.cluster_samples].tolist()
-                sub_loader = DataLoader(
-                    Subset(cluster_loader.dataset, idx),
-                    batch_size=cluster_loader.batch_size, shuffle=False,
-                    num_workers=args.workers,
-                )
-                features = model.get_features(sub_loader, device)
-            else:
-                features = model.get_features(cluster_loader, device)
+            features = model.get_features(cluster_loader, device)
             features_np = features.numpy().astype("float32")
             nan_mask = np.isfinite(features_np).all(axis=1)
             if not nan_mask.all():
-                print(f"  [warning] {(~nan_mask).sum()} NaN features dropped before clustering")
-                features_np = features_np[nan_mask]
+                print(f"  [warning] {(~nan_mask).sum()} NaN features zeroed before clustering")
+                features_np[~nan_mask] = 0.0
             cluster_results = [
                 (c.to(device), a, p.to(device))
                 for c, a, p in cluster_features(
@@ -291,30 +236,41 @@ def main():
         # M-step
         model.train()
         total_loss = 0.0
+        total_info_nce = 0.0
+        total_proto_nce = 0.0
 
         for i, (views, _, indices) in enumerate(train_loader):
             x_q = views[0].to(device)
             x_k = views[1].to(device)
 
             q, k = model(x_q, x_k)
-            loss = criterion(q, k, model.queue, cluster_results, indices, warm_up=warm_up)
+            loss, breakdown = criterion(q, k, model.queue, cluster_results, indices, warm_up=warm_up)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.encoder_q.parameters(), max_norm=1.0)
             optimizer.step()
+            model.enqueue(k)
 
             total_loss += loss.item()
+            total_info_nce += breakdown["info_nce"]
+            total_proto_nce += breakdown.get("proto_nce", 0.0)
             if i % 50 == 0:
                 tag = "(warm-up)" if warm_up else ""
+                proto_str = f" proto={breakdown.get('proto_nce', 0.0):.4f}" if not warm_up else ""
                 print(f"  [{epoch}/{args.epochs}][{i}/{len(train_loader)}] "
-                      f"loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e} {tag}")
+                      f"loss={loss.item():.4f} info={breakdown['info_nce']:.4f}{proto_str} "
+                      f"lr={optimizer.param_groups[0]['lr']:.2e} {tag}")
 
         scheduler.step()
         elapsed = time.time() - t0
-        avg_loss = total_loss / len(train_loader)
+        n_batches = len(train_loader)
+        avg_loss = total_loss / n_batches
+        avg_info = total_info_nce / n_batches
+        avg_proto = total_proto_nce / n_batches
         loss_history.append(avg_loss)
-        print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}  time={elapsed:.1f}s")
+        print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f} "
+              f"(info={avg_info:.4f} proto={avg_proto:.4f})  time={elapsed:.1f}s")
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
             save_checkpoint(
@@ -323,10 +279,6 @@ def main():
                  "args": vars(args)},
                 os.path.join(args.output_dir, f"pcl_epoch{epoch+1:04d}.pth"),
             )
-
-        if args.tsne_freq > 0 and ((epoch + 1) % args.tsne_freq == 0 or epoch == args.epochs - 1):
-            print(f"[Epoch {epoch}] Generating t-SNE...")
-            save_tsne(model, args, epoch, device)
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(range(start_epoch, start_epoch + len(loss_history)), loss_history)

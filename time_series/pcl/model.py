@@ -64,33 +64,28 @@ class ChronosBoltEncoder(nn.Module):
     backbone は完全凍結。proj のみ学習される。
     入力: (batch, in_channels, seq_len)
     出力: (batch, dim)
+
+    時間軸は平均プーリングで集約（末尾マスク時の劣化を回避）。
+    チャンネルは flatten して結合（変量間の相関を proj に渡す）。
     """
-    def __init__(self, chronos_model, dim: int = 128):
+    def __init__(self, chronos_model, in_channels: int, dim: int = 128):
         super().__init__()
         d = chronos_model.config.d_model
         self.out_dim = dim
         self.chronos = chronos_model
         self.proj = nn.Sequential(
-            nn.Linear(d, d),
+            nn.Linear(d * in_channels, d),
             nn.ReLU(),
             nn.Linear(d, dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, C, L = x.shape
-        if C == 1:
-            context = x.squeeze(1).float()
-            with torch.no_grad():
-                hidden, _, _, _ = self.chronos.encode(context)
-            feat = hidden[:, -1, :]
-        else:
-            feats = []
-            for c in range(C):
-                ctx = x[:, c, :].float()
-                with torch.no_grad():
-                    hidden, _, _, _ = self.chronos.encode(ctx)
-                feats.append(hidden[:, -1, :])
-            feat = torch.stack(feats, dim=1).mean(dim=1)
+        context = x.view(batch * C, L).float()
+        with torch.no_grad():
+            hidden, _, _, _ = self.chronos.encode(context)
+        # (batch*C, T, d) → mean over T → (batch*C, d) → (batch, C*d)
+        feat = hidden.mean(dim=1).view(batch, C * hidden.shape[-1])
         return self.proj(feat)
 
 
@@ -142,7 +137,7 @@ class PCL(nn.Module):
             print(f"Loading Chronos-Bolt backbone: {chronos_model_name} ...")
             backbone = _load_chronos_backbone(chronos_model_name)
             def _make():
-                return ChronosBoltEncoder(backbone, dim)
+                return ChronosBoltEncoder(backbone, in_channels, dim)
         else:
             def _make():
                 return build_encoder(encoder_type, in_channels, seq_len, d_model, nhead, num_layers, dim)
@@ -179,13 +174,16 @@ class PCL(nn.Module):
     def forward(self, x_q: torch.Tensor, x_k: torch.Tensor):
         """
         x_q, x_k: (batch, in_channels, seq_len)
+        Returns q, k — caller must call enqueue(k) AFTER computing the loss.
         """
         q = nn.functional.normalize(self.encoder_q(x_q), dim=1)
         with torch.no_grad():
             self._update_momentum_encoder()
             k = nn.functional.normalize(self.encoder_k(x_k), dim=1)
-        self._enqueue(k.detach())
         return q, k
+
+    def enqueue(self, keys: torch.Tensor):
+        self._enqueue(keys.detach())
 
     @torch.no_grad()
     def get_features(self, loader, device: torch.device) -> torch.Tensor:

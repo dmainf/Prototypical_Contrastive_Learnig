@@ -12,10 +12,9 @@ class ProtoNCELoss(nn.Module):
       2. Prototypical contrastive loss across M granularity levels
     """
 
-    def __init__(self, tau: float = 0.1, r: int = 16000):
+    def __init__(self, tau: float = 0.1):
         super().__init__()
         self.tau = tau
-        self.r = r  # number of negative prototypes sampled per forward pass
 
     def _info_nce(
         self, q: torch.Tensor, k: torch.Tensor, queue: torch.Tensor
@@ -35,27 +34,10 @@ class ProtoNCELoss(nn.Module):
         assignments: torch.Tensor,
         phi: torch.Tensor,
     ) -> torch.Tensor:
-        """Prototypical contrastive loss for one granularity level (second term of Eq. 11)."""
-        N = q.shape[0]
-        device = q.device
-        K = prototypes.shape[0]
-
-        # Positive: each sample's assigned prototype
-        pos_proto = prototypes[assignments]                          # (N, D)
-        pos_phi = phi[assignments].clamp(min=1e-4)                   # (N,)
-        pos_sim = (q * pos_proto).sum(dim=1) / pos_phi              # (N,)
-
-        # Sample r random negative prototypes
-        r = min(self.r, K)
-        neg_idx = torch.randperm(K, device=device)[:r]
-        neg_proto = prototypes[neg_idx]                              # (r, D)
-        neg_phi = phi[neg_idx].clamp(min=1e-4)                      # (r,)
-        neg_sim = torch.mm(q, neg_proto.t()) / neg_phi.unsqueeze(0) # (N, r)
-
-        # Cross-entropy: positive is at column 0
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # (N, 1+r)
-        labels = torch.zeros(N, dtype=torch.long, device=device)
-        return F.cross_entropy(logits, labels)
+        """Prototypical contrastive loss for one granularity level (Eq. 10 in the paper)."""
+        # (N, D) x (D, K) -> (N, K), scaled by per-prototype concentration
+        logits = torch.mm(q, prototypes.t()) / phi.clamp(min=self.tau).unsqueeze(0)
+        return F.cross_entropy(logits, assignments)
 
     def forward(
         self,
@@ -65,7 +47,7 @@ class ProtoNCELoss(nn.Module):
         cluster_results: list | None,
         sample_indices: torch.Tensor,
         warm_up: bool = False,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict]:
         """
         q              : (N, D) query features
         k              : (N, D) key features (momentum encoder)
@@ -73,14 +55,20 @@ class ProtoNCELoss(nn.Module):
         cluster_results: list of (centroids, assignments_full, phi) or None
         sample_indices : (N,) indices of current batch within the full dataset
         warm_up        : if True, skip prototypical term (only InfoNCE)
+
+        Returns (loss, breakdown) where breakdown is a dict for logging.
         """
-        loss = self._info_nce(q, k, queue)
+        info_nce = self._info_nce(q, k, queue)
+        loss = info_nce
+        breakdown = {"info_nce": info_nce.item()}
 
         if not warm_up and cluster_results:
             proto_loss = torch.tensor(0.0, device=q.device)
             for centroids, assignments_all, phi in cluster_results:
-                batch_assign = assignments_all[sample_indices.cpu()].to(q.device)
+                batch_assign = assignments_all[sample_indices].to(q.device)
                 proto_loss = proto_loss + self._proto_nce_single(q, centroids, batch_assign, phi)
-            loss = loss + proto_loss / len(cluster_results)
+            proto_loss = proto_loss / len(cluster_results)
+            loss = loss + proto_loss
+            breakdown["proto_nce"] = proto_loss.item()
 
-        return loss
+        return loss, breakdown

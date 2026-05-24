@@ -33,12 +33,14 @@
 | `encoder_k` | 重みが固定されたMomentumエンコーダ (EMA更新) |
 | `queue` | インスタンスワイズ対照学習用の負例キュー (shape: `dim × queue_size`) |
 
-- `forward(x_q, x_k)`: 2つのaugmented viewを受け取り、queryとkey特徴量を返す。Momentumエンコーダの重みをEMAで更新し、keyをキューに追加する
+- `forward(x_q, x_k)`: 2つのaugmented viewを受け取り、queryとkey特徴量を返す。Momentumエンコーダの重みをEMAで更新する。キューへの追加は損失計算後に `enqueue(k)` を呼び出すことで行う
+- `enqueue(keys)`: keyをキューに追加する。`train.py` で損失計算・`optimizer.step()` の後に呼び出す
 - `get_features(loader, device)`: Momentumエンコーダで全訓練データの特徴量を抽出する（クラスタリング用）
 
 ```
-encoder_q ──→ L2-normalize ──→ q
-encoder_k ──→ L2-normalize ──→ k ──→ queue に追加
+encoder_q ──→ L2-normalize ──→ q ──┐
+                                    ├── loss() ── optimizer.step() ── enqueue(k)
+encoder_k ──→ L2-normalize ──→ k ──┘
 (EMAで更新)
 ```
 
@@ -46,7 +48,7 @@ encoder_k ──→ L2-normalize ──→ k ──→ queue に追加
 
 | エンコーダ | 入力 | 処理 | 出力 |
 |---|---|---|---|
-| `chronos` (デフォルト) | `(B, C, L)` | Chronos-Bolt encoder → REG トークン → 2層MLP projection head | `(B, dim)` |
+| `chronos` (デフォルト) | `(B, C, L)` | Chronos-Bolt encoder → 時間軸 Mean Pooling → チャンネル Flatten → 2層MLP projection head | `(B, dim)` |
 | `transformer` | `(B, C, L)` | Linear投影 → 位置エンコーディング → Transformer → 平均プーリング → Linear | `(B, dim)` |
 | `cnn` | `(B, C, L)` | Conv1d×3 (stride=2) → AdaptiveAvgPool1d(1) → Linear | `(B, dim)` |
 
@@ -54,7 +56,7 @@ encoder_k ──→ L2-normalize ──→ k ──→ queue に追加
 
 - Amazon の事前学習済み Chronos-Bolt モデルを使用。バックボーンは完全凍結（勾配なし）。
 - encoder_q と encoder_k でバックボーンを共有しているためメモリは1コピー分のみ。
-- **学習されるのは projection head のみ**（2層MLP: `d_model → d_model → dim`）。バックボーンは更新されない。
+- **学習されるのは projection head のみ**（2層MLP: `d_model * C → d_model → dim`）。バックボーンは更新されない。
 - `--chronos-model` でモデルサイズを選択可能（下記参照）。デフォルトは `chronos-bolt-small`。
 
 ---
@@ -63,7 +65,7 @@ encoder_k ──→ L2-normalize ──→ k ──→ queue に追加
 
 **クラス: `ProtoNCELoss`**
 
-論文 Eq.11 を実装。2つの項の和：
+論文 Eq.10/11 を実装。2つの項の和：
 
 ```
 L_ProtoNCE = L_InfoNCE (インスタンスワイズ) + (1/M) * Σ L_proto_m (プロトタイプ対照)
@@ -72,7 +74,7 @@ L_ProtoNCE = L_InfoNCE (インスタンスワイズ) + (1/M) * Σ L_proto_m (プ
 | メソッド | 役割 |
 |---|---|
 | `_info_nce` | MoCo方式のInfoNCE損失。qとkの正例ペア vs キュー内の負例 |
-| `_proto_nce_single` | 1粒度分のプロトタイプ対照損失。qと割当プロトタイプ(正例) vs ランダムサンプルしたrプロトタイプ(負例) |
+| `_proto_nce_single` | 1粒度分のプロトタイプ対照損失（Eq.10）。全Kプロトタイプとの類似度を行列積で一括計算し、割当クラスタIDをターゲットとしたクロスエントロピー |
 | `forward` | warm_up=True のときはInfoNCEのみ、Falseのときは両方の和を返す |
 
 ---
@@ -105,9 +107,10 @@ EMフレームワークのE-stepに対応。
 
 | クラス | 役割 |
 |---|---|
-| `Jitter` | ガウスノイズを付加するAugmentation |
-| `WindowSlicing` | ランダムクロップ＋リサイズ（画像のRandomCropに相当） |
-| `TimeSeriesAugmentation` | Jitter + WindowSlicing の組み合わせ |
+| `Jitter` | ガウスノイズを付加。周期性・位相を保持 |
+| `Scaling` | 信号全体にランダムなスカラーを乗算。振幅依存性を排除し波形ダイナミクスに着目させる |
+| `ContinuousMasking` | 系列中間の連続区間をゼロでマスク。時間軸伸縮なしで周波数特性を完全保持 |
+| `TimeSeriesAugmentation` | Scaling + ContinuousMasking + Jitter の組み合わせ |
 | `TwoViewTransform` | 同じウィンドウに異なるAugmentationを2回適用し、2つのviewを生成 |
 | `IndexedDataset` | 既存Datasetをラップし、`(data, label, index)` を返すようにする |
 | `TimeSeriesDataset` | CSVから時系列を読み込み、スライディングウィンドウでサンプルを生成 |
@@ -235,18 +238,18 @@ pip3 install chronos-forecasting --break-system-packages
 | 重要度 | オプション | デフォルト | 説明 |
 |:---:|---|---|---|
 | ★☆☆ | `--jitter-sigma` | `0.03` | Jitterのノイズ強度 |
-| ★☆☆ | `--slice-ratio` | `0.9` | WindowSlicingの切り取り割合（0〜1） |
-| ★☆☆ | `--no-jitter` | （なし） | このフラグを付けるとJitterを無効化 |
-| ★☆☆ | `--no-slicing` | （なし） | このフラグを付けるとWindowSlicingを無効化 |
+| ★☆☆ | `--scale-range` | `0.8 1.2` | Scalingの振幅スケール範囲（LOW HIGH の2値） |
+| ★☆☆ | `--mask-ratio` | `0.2` | ContinuousMaskingでマスクする区間長の割合（0〜1） |
+| ★☆☆ | `--no-jitter` | （なし） | Jitterを無効化 |
+| ★☆☆ | `--no-scaling` | （なし） | Scalingを無効化 |
+| ★☆☆ | `--no-masking` | （なし） | ContinuousMaskingを無効化 |
 
 #### 対照学習・クラスタリング
 
 | 重要度 | オプション | デフォルト | 説明 |
 |:---:|---|---|---|
 | ★★★ | `--num-clusters` | `50 200 500` | クラスタ数（複数指定で階層的プロトタイプ） |
-| ★★☆ | `--cluster-samples` | `50000` | E-stepで特徴抽出に使うサンプル数（0=全件）。大規模データでE-stepを高速化する |
 | ★★☆ | `--queue-size` | `4096` | 負例キューのサイズ |
-| ★★☆ | `--r` | `500` | 1ステップでサンプルする負例プロトタイプ数 |
 | ★☆☆ | `--tau` | `0.1` | 温度パラメータ |
 | ★☆☆ | `--momentum` | `0.999` | Momentumエンコーダの更新係数 |
 | ★☆☆ | `--alpha` | `10.0` | 濃度推定の平滑化係数 |
@@ -346,7 +349,7 @@ python3 visualize_umap.py --checkpoints-dir ./checkpoints
 | 論文の要素 | 実装箇所 |
 |---|---|
 | EMフレームワーク | `train.py` の学習ループ |
-| ProtoNCE損失 Eq.11 | `pcl/loss.py:ProtoNCELoss` |
+| ProtoNCE損失 Eq.10 | `pcl/loss.py:ProtoNCELoss` |
 | 濃度推定 φ Eq.12 | `pcl/clustering.py:_concentration` |
 | φの正規化 (mean=τ) | `pcl/clustering.py:cluster_features` |
 | Momentumエンコーダ EMA更新 | `pcl/model.py:_update_momentum_encoder` |
@@ -361,7 +364,7 @@ python3 visualize_umap.py --checkpoints-dir ./checkpoints
 | 項目 | 画像版 | 時系列版 |
 |---|---|---|
 | エンコーダ | ResNet (torchvision) | Transformer / CNN1D / Chronos-Bolt |
-| Augmentation | RandomCrop, ColorJitter, etc. | Jitter, WindowSlicing |
+| Augmentation | RandomCrop, ColorJitter, etc. | Jitter, Scaling, ContinuousMasking |
 | サンプル単位 | 画像1枚 | スライディングウィンドウ |
 | データモード | クラスラベルあり | individuals（個体ごとの系列） |
 | 可視化の色 | クラスラベル | 時刻位置 (0=始め → 1=終わり) |
