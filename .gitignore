@@ -2,5 +2,5 @@
 .DS_Store
 datasets/
 data/
-checkpoints/
+checkpoints*
 *.png
