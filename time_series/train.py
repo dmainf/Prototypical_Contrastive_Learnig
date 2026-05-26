@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 from pcl.model import PCL
-from pcl.loss import ProtoNCELoss
+from pcl.loss import HybridContrastiveLoss
 from pcl.clustering import cluster_features
 from pcl.dataset import (
     TimeSeriesDataset, TwoViewTransform, IndexedDataset,
@@ -84,6 +84,19 @@ def parse_args():
     p.add_argument("--queue-size", default=4096, type=int)
     p.add_argument("--momentum", default=0.999, type=float)
     p.add_argument("--tau", default=0.1, type=float)
+    # Loss の設計（直交する2軸）
+    p.add_argument("--base-loss", default="align_uniform",
+                   choices=["infonce", "align_uniform"],
+                   help="ベース損失: infonce (MoCo方式) / align_uniform (Wang & Isola, ICML 2020)")
+    p.add_argument("--use-proto", action="store_true",
+                   help="ProtoNCEをベース損失に加算する（EMクラスタリングを有効化）")
+    # Alignment / Uniformity パラメータ（--base-loss align_uniform のみ有効）
+    p.add_argument("--align-alpha", default=2.0, type=float,
+                   help="L_align のべき乗パラメータ alpha")
+    p.add_argument("--uniform-t", default=2.0, type=float,
+                   help="L_uniform のガウスカーネルパラメータ t")
+    p.add_argument("--lam", default=1.0, type=float,
+                   help="L_uniform の重み λ: loss = L_align + λ * L_uniform")
     # クラスタリング
     p.add_argument("--num-clusters", nargs="+", type=int, default=[50, 200, 500],
                    help="クラスタ数（複数指定で階層的プロトタイプ）")
@@ -190,7 +203,14 @@ def main():
         lr=args.lr, weight_decay=args.weight_decay,
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = ProtoNCELoss(tau=args.tau)
+    criterion = HybridContrastiveLoss(
+        base_type=args.base_loss,
+        use_proto=args.use_proto,
+        alpha=args.align_alpha,
+        t=args.uniform_t,
+        lam=args.lam,
+        tau=args.tau,
+    )
 
     start_epoch = 0
     cluster_results = None
@@ -217,7 +237,7 @@ def main():
         t0 = time.time()
 
         # E-step
-        if not warm_up:
+        if args.use_proto and not warm_up:
             print(f"[Epoch {epoch}] E-step: extracting features...")
             features = model.get_features(cluster_loader, device)
             features_np = features.numpy().astype("float32")
@@ -244,22 +264,28 @@ def main():
             x_k = views[1].to(device)
 
             q, k = model(x_q, x_k)
-            loss, breakdown = criterion(q, k, model.queue, cluster_results, indices, warm_up=warm_up)
+            loss, breakdown = criterion(q, k, model.queue, cluster_results, indices, is_warmup=warm_up)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.encoder_q.parameters(), max_norm=1.0)
             optimizer.step()
-            model.enqueue(k)
+
+            if args.base_loss == "infonce":
+                model.enqueue(k)
 
             total_loss += loss.item()
-            total_info_nce += breakdown["info_nce"]
+            total_info_nce += breakdown.get("info_nce", 0.0)
             total_proto_nce += breakdown.get("proto_nce", 0.0)
             if i % 50 == 0:
                 tag = "(warm-up)" if warm_up else ""
-                proto_str = f" proto={breakdown.get('proto_nce', 0.0):.4f}" if not warm_up else ""
+                if "info_nce" in breakdown:
+                    base_str = f"info={breakdown['info_nce']:.4f}"
+                else:
+                    base_str = f"align={breakdown['align']:.4f} uniform={breakdown['uniform']:.4f}"
+                proto_str = f" proto={breakdown['proto_nce']:.4f}" if "proto_nce" in breakdown else ""
                 print(f"  [{epoch}/{args.epochs}][{i}/{len(train_loader)}] "
-                      f"loss={loss.item():.4f} info={breakdown['info_nce']:.4f}{proto_str} "
+                      f"loss={loss.item():.4f} {base_str}{proto_str} "
                       f"lr={optimizer.param_groups[0]['lr']:.2e} {tag}")
 
         scheduler.step()
@@ -269,8 +295,9 @@ def main():
         avg_info = total_info_nce / n_batches
         avg_proto = total_proto_nce / n_batches
         loss_history.append(avg_loss)
+        base_label = "info" if args.base_loss == "infonce" else "base"
         print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f} "
-              f"(info={avg_info:.4f} proto={avg_proto:.4f})  time={elapsed:.1f}s")
+              f"({base_label}={avg_info:.4f} proto={avg_proto:.4f})  time={elapsed:.1f}s")
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
             save_checkpoint(

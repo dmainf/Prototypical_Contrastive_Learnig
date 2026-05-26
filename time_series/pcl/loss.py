@@ -3,27 +3,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ProtoNCELoss(nn.Module):
+class HybridContrastiveLoss(nn.Module):
     """
-    ProtoNCE loss (Eq. 11 in the paper).
+    Unified contrastive loss supporting 4 modes via base_type × use_proto:
 
-    Combines:
-      1. Instance-wise InfoNCE (MoCo-style, using a queue of negative keys)
-      2. Prototypical contrastive loss across M granularity levels
+      base_type="infonce",      use_proto=False  →  pure InfoNCE (MoCo-style)
+      base_type="infonce",      use_proto=True   →  PCL (InfoNCE + ProtoNCE)
+      base_type="align_uniform", use_proto=False →  pure Align & Uniform
+      base_type="align_uniform", use_proto=True  →  hybrid (Align & Uniform + ProtoNCE)
     """
 
-    def __init__(self, tau: float = 0.1):
+    def __init__(
+        self,
+        base_type: str = "align_uniform",
+        use_proto: bool = True,
+        alpha: float = 2.0,
+        t: float = 2.0,
+        lam: float = 1.0,
+        tau: float = 0.1,
+    ):
         super().__init__()
+        self.base_type = base_type
+        self.use_proto = use_proto
+        self.alpha = alpha
+        self.t = t
+        self.lam = lam
         self.tau = tau
 
-    def _info_nce(
-        self, q: torch.Tensor, k: torch.Tensor, queue: torch.Tensor
-    ) -> torch.Tensor:
-        """Instance-wise InfoNCE (Eq. 1 / first term of Eq. 11)."""
+    def _align(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return (x - y).norm(dim=1).pow(self.alpha).mean()
+
+    def _uniform(self, x: torch.Tensor) -> torch.Tensor:
+        sq_pdist = torch.pdist(x, p=2).pow(2)
+        return sq_pdist.mul(-self.t).exp().mean().log()
+
+    def _info_nce(self, q: torch.Tensor, k: torch.Tensor, queue: torch.Tensor) -> torch.Tensor:
         N = q.shape[0]
-        l_pos = (q * k).sum(dim=1, keepdim=True) / self.tau       # (N, 1)
-        l_neg = torch.mm(q, queue.detach()) / self.tau             # (N, K)
-        logits = torch.cat([l_pos, l_neg], dim=1)                  # (N, 1+K)
+        l_pos = (q * k).sum(dim=1, keepdim=True) / self.tau
+        l_neg = torch.mm(q, queue.detach()) / self.tau
+        logits = torch.cat([l_pos, l_neg], dim=1)
         labels = torch.zeros(N, dtype=torch.long, device=q.device)
         return F.cross_entropy(logits, labels)
 
@@ -34,8 +52,6 @@ class ProtoNCELoss(nn.Module):
         assignments: torch.Tensor,
         phi: torch.Tensor,
     ) -> torch.Tensor:
-        """Prototypical contrastive loss for one granularity level (Eq. 10 in the paper)."""
-        # (N, D) x (D, K) -> (N, K), scaled by per-prototype concentration
         logits = torch.mm(q, prototypes.t()) / phi.clamp(min=self.tau).unsqueeze(0)
         return F.cross_entropy(logits, assignments)
 
@@ -46,23 +62,24 @@ class ProtoNCELoss(nn.Module):
         queue: torch.Tensor,
         cluster_results: list | None,
         sample_indices: torch.Tensor,
-        warm_up: bool = False,
+        is_warmup: bool = False,
     ) -> tuple[torch.Tensor, dict]:
-        """
-        q              : (N, D) query features
-        k              : (N, D) key features (momentum encoder)
-        queue          : (D, queue_size) negative key queue
-        cluster_results: list of (centroids, assignments_full, phi) or None
-        sample_indices : (N,) indices of current batch within the full dataset
-        warm_up        : if True, skip prototypical term (only InfoNCE)
+        breakdown = {}
 
-        Returns (loss, breakdown) where breakdown is a dict for logging.
-        """
-        info_nce = self._info_nce(q, k, queue)
-        loss = info_nce
-        breakdown = {"info_nce": info_nce.item()}
+        if self.base_type == "align_uniform":
+            l_align = self._align(q, k)
+            l_uniform = (self._uniform(q) + self._uniform(k)) / 2.0
+            base_loss = l_align + self.lam * l_uniform
+            breakdown["align"] = l_align.item()
+            breakdown["uniform"] = l_uniform.item()
+        else:
+            base_loss = self._info_nce(q, k, queue)
+            breakdown["info_nce"] = base_loss.item()
 
-        if not warm_up and cluster_results:
+        breakdown["base_loss"] = base_loss.item()
+        loss = base_loss
+
+        if self.use_proto and not is_warmup and cluster_results:
             proto_loss = torch.tensor(0.0, device=q.device)
             for centroids, assignments_all, phi in cluster_results:
                 batch_assign = assignments_all[sample_indices].to(q.device)
