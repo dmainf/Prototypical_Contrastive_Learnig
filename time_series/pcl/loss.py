@@ -34,8 +34,13 @@ class HybridContrastiveLoss(nn.Module):
         return (x - y).norm(dim=1).pow(self.alpha).mean()
 
     def _uniform(self, x: torch.Tensor) -> torch.Tensor:
-        sq_pdist = torch.pdist(x, p=2).pow(2)
-        return sq_pdist.mul(-self.t).exp().mean().log()
+        # torch.pdist is unsupported on MPS; use equivalent matrix ops instead
+        sq_norms = (x * x).sum(dim=1)
+        sq_pdist = sq_norms.unsqueeze(1) + sq_norms.unsqueeze(0) - 2.0 * (x @ x.t())
+        sq_pdist = sq_pdist.clamp(min=0)
+        n = x.shape[0]
+        mask = torch.ones(n, n, dtype=torch.bool, device=x.device).triu(diagonal=1)
+        return sq_pdist[mask].mul(-self.t).exp().mean().log()
 
     def _info_nce(self, q: torch.Tensor, k: torch.Tensor, queue: torch.Tensor) -> torch.Tensor:
         N = q.shape[0]

@@ -10,6 +10,7 @@ Usage (多変量 / CNNエンコーダ):
 """
 
 import argparse
+import csv
 import os
 import time
 
@@ -215,6 +216,7 @@ def main():
     start_epoch = 0
     cluster_results = None
     loss_history = []
+    loss_rows = []
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -256,7 +258,7 @@ def main():
         # M-step
         model.train()
         total_loss = 0.0
-        total_info_nce = 0.0
+        total_base = 0.0
         total_proto_nce = 0.0
 
         for i, (views, _, indices) in enumerate(train_loader):
@@ -275,7 +277,7 @@ def main():
                 model.enqueue(k)
 
             total_loss += loss.item()
-            total_info_nce += breakdown.get("info_nce", 0.0)
+            total_base += breakdown["base_loss"]
             total_proto_nce += breakdown.get("proto_nce", 0.0)
             if i % 50 == 0:
                 tag = "(warm-up)" if warm_up else ""
@@ -292,12 +294,13 @@ def main():
         elapsed = time.time() - t0
         n_batches = len(train_loader)
         avg_loss = total_loss / n_batches
-        avg_info = total_info_nce / n_batches
+        avg_base = total_base / n_batches
         avg_proto = total_proto_nce / n_batches
         loss_history.append(avg_loss)
-        base_label = "info" if args.base_loss == "infonce" else "base"
+        loss_rows.append({"epoch": epoch, "loss": round(avg_loss, 6),
+                          "base": round(avg_base, 6), "proto": round(avg_proto, 6)})
         print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f} "
-              f"({base_label}={avg_info:.4f} proto={avg_proto:.4f})  time={elapsed:.1f}s")
+              f"(base={avg_base:.4f} proto={avg_proto:.4f})  time={elapsed:.1f}s")
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
             save_checkpoint(
@@ -319,6 +322,13 @@ def main():
     fig.savefig(loss_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Loss curve saved: {loss_path}")
+
+    csv_path = os.path.join(args.output_dir, "loss.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch", "loss", "base", "proto"])
+        writer.writeheader()
+        writer.writerows(loss_rows)
+    print(f"Loss CSV saved: {csv_path}")
 
 if __name__ == "__main__":
     main()
