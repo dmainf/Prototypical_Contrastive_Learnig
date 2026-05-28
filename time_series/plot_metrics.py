@@ -31,8 +31,10 @@ def plot(epochs, data, ylabel, title, out_path, lower_is_better=True):
     plt.close(fig)
     print(f"Saved: {out_path}")
 
-epochs_a, align = read_csv(f"{DIR}/alignment.csv")
-epochs_u, unif  = read_csv(f"{DIR}/uniformity.csv")
+epochs_a, align   = read_csv(f"{DIR}/alignment.csv")
+epochs_u, unif    = read_csv(f"{DIR}/uniformity.csv")
+epochs_n, infonce = read_csv(f"{DIR}/infonce.csv")
+epochs_p, protonc = read_csv(f"{DIR}/protonce.csv")
 
 plot(epochs_a, align,
      ylabel="Mean L2 distance (↓ better)",
@@ -43,3 +45,13 @@ plot(epochs_u, unif,
      ylabel="Uniformity loss (↓ better)",
      title="Uniformity over Training",
      out_path=f"{DIR}/plot_uniformity.png")
+
+plot(epochs_n, infonce,
+     ylabel="InfoNCE loss (↓ better)",
+     title="InfoNCE (in-batch) over Training",
+     out_path=f"{DIR}/plot_infonce.png")
+
+plot(epochs_p, protonc,
+     ylabel="ProtoNCE loss (↓ better)",
+     title="ProtoNCE over Training",
+     out_path=f"{DIR}/plot_protonce.png")

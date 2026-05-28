@@ -1,11 +1,13 @@
+import os as _os
+
 import numpy as np
 import torch
 
-import os as _os
 _os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 try:
     import faiss
+
     _FAISS = True
 except ImportError:
     _FAISS = False
@@ -21,6 +23,7 @@ def _kmeans_faiss(features: np.ndarray, k: int, niter: int = 20) -> tuple:
 
 def _kmeans_sklearn(features: np.ndarray, k: int) -> tuple:
     from sklearn.cluster import MiniBatchKMeans
+
     km = MiniBatchKMeans(n_clusters=k, n_init=3, max_iter=100, random_state=42)
     assignments = km.fit_predict(features)
     return km.cluster_centers_.astype(np.float32), assignments
@@ -29,6 +32,7 @@ def _kmeans_sklearn(features: np.ndarray, k: int) -> tuple:
 def _run_kmeans(features: np.ndarray, k: int, backend: str = "auto") -> tuple:
     """backend: 'faiss' | 'sklearn' | 'auto' (faiss on Linux, sklearn on macOS)"""
     import platform
+
     use_faiss = (
         _FAISS
         and backend == "faiss"
@@ -83,10 +87,12 @@ def cluster_features(
             phi = phi / mean_phi * tau
         norms = np.linalg.norm(centroids, axis=1, keepdims=True)
         centroids = centroids / np.maximum(norms, 1e-8)
-        results.append((
-            torch.tensor(centroids, dtype=torch.float32),
-            torch.tensor(assignments, dtype=torch.long),
-            torch.tensor(phi, dtype=torch.float32),
-        ))
+        results.append(
+            (
+                torch.tensor(centroids, dtype=torch.float32),
+                torch.tensor(assignments, dtype=torch.long),
+                torch.tensor(phi, dtype=torch.float32),
+            )
+        )
         print("done")
     return results
